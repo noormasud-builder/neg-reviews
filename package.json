@@ -9,6 +9,7 @@
   },
   "scripts": {
     "build": "tsc",
+    "typecheck": "tsc --noEmit -p tsconfig.all.json",
     "start": "node dist/index.js",
     "dev": "tsx watch src/index.ts",
     "replay": "tsx scripts/replay.ts"

@@ -46,11 +46,47 @@ function verifySlackSignature(req: express.Request, raw: Buffer): boolean {
 
 /* -------------------------------------------------------------------------- */
 
+/**
+ * Config is checked at boot rather than on first use. The GL client is created
+ * lazily, so without this the service would deploy green, pass its health check,
+ * and then fail silently on the first real review — the one moment anyone cares
+ * about. Better to shout about it on startup and surface it on /health.
+ */
+function missingConfig(): string[] {
+  const missing: string[] = [];
+  if (!process.env.SLACK_SIGNING_SECRET) missing.push('SLACK_SIGNING_SECRET');
+  if (!process.env.SLACK_BOT_TOKEN) missing.push('SLACK_BOT_TOKEN');
+
+  const adapter = (process.env.GL_ADAPTER ?? 'mcp').toLowerCase();
+  if (adapter === 'mcp') {
+    if (!process.env.GL_MCP_URL) missing.push('GL_MCP_URL');
+    if (!process.env.GL_MCP_TOKEN) missing.push('GL_MCP_TOKEN');
+  } else if (adapter === 'mysql') {
+    for (const k of ['GL_DB_HOST', 'GL_DB_USER', 'GL_DB_PASSWORD', 'GL_DB_NAME']) {
+      if (!process.env[k]) missing.push(k);
+    }
+  } else {
+    missing.push(`GL_ADAPTER (got "${adapter}", expected "mcp" or "mysql")`);
+  }
+  return missing;
+}
+
+const MISSING = missingConfig();
+
 const app = express();
 app.use(express.raw({ type: 'application/json', limit: '2mb' }));
 
 app.get('/health', (_req, res) => {
-  res.json({ ok: true, adapter: process.env.GL_ADAPTER ?? 'mcp', dryRun: DRY_RUN });
+  // Still 200 so Railway's health check passes and you can read the diagnosis;
+  // configOk is the field to actually look at.
+  res.json({
+    ok: true,
+    configOk: MISSING.length === 0,
+    missingConfig: MISSING,
+    adapter: process.env.GL_ADAPTER ?? 'mcp',
+    dryRun: DRY_RUN,
+    channels: [...CHANNELS],
+  });
 });
 
 /** Slack retries anything it doesn't hear back from within 3s. Dedupe on event_id. */
@@ -118,10 +154,32 @@ async function handleMessage(event: SlackEvent): Promise<void> {
     date: parsed.courseDate,
   });
 
-  const result = await matchReview(parsed, glClient(), {
-    lookbackDays: LOOKBACK_DAYS,
-    maxCandidates: MAX_CANDIDATES,
-  });
+  if (MISSING.length) {
+    console.error(
+      `[handler] REVIEW RECEIVED BUT NOT ANSWERED — missing config: ${MISSING.join(', ')}`,
+    );
+    return;
+  }
+
+  let result;
+  try {
+    result = await matchReview(parsed, glClient(), {
+      lookbackDays: LOOKBACK_DAYS,
+      maxCandidates: MAX_CANDIDATES,
+    });
+  } catch (err) {
+    // A lookup failure is worth knowing about in the channel — otherwise the
+    // bot just goes quiet and everyone assumes it matched nothing.
+    console.error('[handler] lookup failed', err);
+    if (!DRY_RUN) {
+      await slack.chat.postMessage({
+        channel: event.channel,
+        thread_ts: event.ts,
+        text: ":warning: Couldn't reach the booking database for this one — check the service logs.",
+      }).catch(() => {});
+    }
+    return;
+  }
 
   const text = formatReply(parsed, result);
 
@@ -142,6 +200,17 @@ async function handleMessage(event: SlackEvent): Promise<void> {
 app.listen(PORT, () => {
   console.log(`who-posted-it listening on :${PORT}`);
   console.log(`  adapter=${process.env.GL_ADAPTER ?? 'mcp'} dryRun=${DRY_RUN} channels=${[...CHANNELS].join(',') || '(all)'}`);
+  if (MISSING.length) {
+    console.error('');
+    console.error('  ' + '!'.repeat(70));
+    console.error(`  NOT READY — these environment variables are unset:`);
+    for (const m of MISSING) console.error(`    - ${m}`);
+    console.error('  Slack events will be received and logged, but no replies will be sent.');
+    console.error('  ' + '!'.repeat(70));
+    console.error('');
+  } else {
+    console.log('  config OK — ready to answer reviews');
+  }
 });
 
 for (const sig of ['SIGINT', 'SIGTERM'] as const) {
